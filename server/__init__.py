@@ -3,20 +3,36 @@
 
 import eventlet
 import logging
+import json
 import os
+import gc
+from sys import getsizeof
 from flask import Flask, render_template, jsonify, request
-from flask_socketio import SocketIO, join_room, leave_room, send, emit
+from flask_socketio import SocketIO, join_room, leave_room, close_room, send, emit
+from datetime import datetime, timedelta
+from functools import reduce
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
+from dotenv import load_dotenv
+load_dotenv()
+
 # attempt a relative import
 try:
     from .codenames import game
 except (ImportError, ValueError):
     from codenames import game
 
-eventlet.monkey_patch()
+# init sentry
+sentry_dsn = os.getenv("SENTRY_DSN")
+if sentry_dsn:
+    sentry_sdk.init(
+        dsn=sentry_dsn,
+        integrations=[FlaskIntegration()]
+    )
 
 app = Flask(__name__)
 socketio = SocketIO(app)
-app.secret_key = b'FF\x90}\xdc\xc5\xaeaT\xd6\xbc\x86O\xa6B\xdd\xa2qp\x9e\xd2f\xe8\xe8'
+app.secret_key = os.getenv("SECRET_KEY", "")
 
 # set up logging
 if not app.debug:
@@ -25,30 +41,66 @@ if not app.debug:
     app.logger.setLevel(gunicorn_logger.level)
 
 ROOMS = {}
+ACTIVE_CLIENTS = 0
 
-# @app.route('/purge')
-# def purge():
-#     """Delete all rooms"""
-#     purged = ROOMS.keys()
-#     total = len(purged)
-#     ROOMS.clear()
-#     return jsonify({
-#         "purged": purged,
-#         "total": total
-#     })
+def prune():
+    """Prune rooms stale for more than 6 hours"""
+    def delete_room(gid):
+        close_room(gid)
+        del ROOMS[gid]
+
+    def is_stale(room):
+        """Stale rooms are older than 6 hours, or have gone 20 minutes less than 5 minutes of total playtime"""
+        return (((datetime.now() - room.date_modified).total_seconds() >= (60*60*12)) or
+            ((datetime.now() - room.date_modified).total_seconds() >= (60*20) and
+            room.playtime() <= 5))
+
+    if ROOMS:
+        rooms = ROOMS.copy()
+        for key in rooms.keys():
+            if is_stale(ROOMS[key]):
+                delete_room(key)
+        del rooms
+        gc.collect()
+
+@app.route('/debug-sentry')
+def trigger_error():
+    division_by_zero = 1 / 0
 
 @app.route('/stats')
 def stats():
     """display room stats"""
     resp = {
-        "total": len(ROOMS.keys())
+        "active_clients": ACTIVE_CLIENTS,
+        "total": len(ROOMS.keys()),
+        "bytes_used": getsizeof(ROOMS),
+        "rooms": None
     }
-    if 'rooms' in request.args:
-        if ROOMS:
-            resp["rooms"] = sorted([ v.to_json() for v in ROOMS.values() ], key=lambda k: k.get('date_modified'), reverse=True)
+    if 'rooms' in request.args and ROOMS:
+        if 'all' in request.args:
+            resp["rooms"] = sorted([ v.to_json() for v in ROOMS.values() ], \
+                key=lambda k: k.get('date_modified'), reverse=True)
         else:
-            resp["rooms"] = None
+            resp["rooms"] = sorted([ {
+                "id": v.game_id,
+                "dictionary": v.dictionary,
+                "date_modified": v.date_modified,
+                "playtime": v.playtime(),
+                "custom": bool(v.wordbank)
+            } for v in ROOMS.values() ], \
+                key=lambda k: k.get('date_modified'), reverse=True)
     return jsonify(resp)
+
+@socketio.on('connect')
+def on_connect():
+    global ACTIVE_CLIENTS
+    ACTIVE_CLIENTS += 1
+    emit('active_clients', ACTIVE_CLIENTS)
+
+@socketio.on('disconnect')
+def on_disconnect():
+    global ACTIVE_CLIENTS
+    ACTIVE_CLIENTS -= 1
 
 @socketio.on('create')
 def on_create(data):
@@ -56,6 +108,7 @@ def on_create(data):
     # username = data['username']
     # create the game
     # handle custom wordbanks
+    # prune old rooms
     if data['dictionaryOptions']['useCustom']:
         gm = game.Info(
             size=data['size'],
@@ -67,6 +120,7 @@ def on_create(data):
             size=data['size'],
             teams=data['teams'],
             mix=data['dictionaryOptions']['mixPercentages'])
+
     # handle standard single dictionary
     else:
         gm = game.Info(
@@ -79,6 +133,7 @@ def on_create(data):
     join_room(room)
     # rooms[room].add_player(username)
     emit('join_room', {'room': room})
+    prune()
 
 @socketio.on('join')
 def on_join(data):
@@ -106,16 +161,14 @@ def on_leave(data):
 @socketio.on('flip_card')
 def on_flip_card(data):
     """flip card and rebroadcast game object"""
-    room = data['room']
-    card = data['card']
-    ROOMS[room].flip_card(card)
-    send(ROOMS[room].to_json(), room=room)
+    ROOMS[data['room']].flip_card(data['card'])
+    send(ROOMS[data['room']].to_json(), room=data['room'])
 
 @socketio.on('regenerate')
 def on_regenerate(data):
     """regenerate the words list"""
     room = data['room']
-    ROOMS[room].generate_board()
+    ROOMS[room].generate_board(data.get('newGame', False))
     send(ROOMS[room].to_json(), room=room)
 
 @socketio.on('list_dictionaries')

@@ -4,20 +4,18 @@ import time
 import random
 import math
 import string
+import yaml
 import os
+from codenames import players
 
-# dictionaries
-APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-FILE_ROOT = os.path.join(APP_ROOT, '..', 'dictionaries')
-DICTIONARIES = {
-    "CAH" :         FILE_ROOT + "/cah_code_names.txt",
-    "Pop Culture" : FILE_ROOT + "/code_names_pop.txt",
-    "Standard" :    FILE_ROOT + "/code_names_dict.txt",
-    "Simple" :      FILE_ROOT + "/code_names_simple.txt",
-    "French" :      FILE_ROOT + "/code_names_french.txt",
-    "Portuguese" :  FILE_ROOT + "/code_names_portuguese.txt",
-    "German" :  FILE_ROOT + "/code_names_german.txt"
-}
+# load dictionaries
+config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dictionaries.yml')
+with open(config_path, 'r') as stream:
+    try:
+        DICTIONARIES = yaml.safe_load(stream)
+    except yaml.YAMLError as exc:
+        DICTIONARIES = {}
+
 # colors per team
 RED = 'R'
 BLUE = 'B'
@@ -29,23 +27,23 @@ BOARD_SIZE = {
 }
 BIG_BLACKOUT_SPOTS = [4, 20, 24, 36, 40, 44, 56, 60, 76]
 
-
-
-class Info(object):
+class Game(object):
     # pylint: disable=too-many-instance-attributes
     """Object for tracking game stats"""
-    def __init__(self, dictionary='Simple', size='normal', teams=2, wordbank=False, mix=False):
+    def __init__(self, dictionary='English', size='normal', teams=2, wordbank=False, mix=False):
         self.wordbank = wordbank
+        self.dictionary = dictionary        
+        self.wordbank = wordbank if wordbank else self.__load_dictionary(self.dictionary)
+        self.original_wordbank = self.wordbank[:]
         self.game_id = self.generate_room_id()
         self.starting_color = RED
         self.date_created = datetime.now()
         self.date_modified = self.date_created
-        self.players = []
         self.size = size
         self.teams = teams
-        self.dictionary = dictionary
         self.mix = mix
-        self.dictionaries = DICTIONARIES.keys()
+        self.minWords = BOARD_SIZE[self.size]
+        self.players = players.Players()
 
         # gererate board
         self.generate_board()
@@ -55,23 +53,31 @@ class Info(object):
         return {
             "game_id": self.game_id,
             "starting_color": self.starting_color,
-            "players": self.players,
+            "players": self.players.as_dict(),
             "date_created": str(self.date_created),
             "date_modified": str(self.date_modified),
-            "playtime": self.__playtime(),
+            "playtime": self.playtime(),
             "board": self.board,
             "solution": self.solution,
             "options": {
                 "dictionary": self.dictionary,
                 "size": self.size,
                 "teams": self.teams,
-                "mix": self.mix
-            },
-
+                "mix": self.mix,
+                "custom": self.wordbank
+            }
         }
 
-    def generate_board(self):
+    def generate_board(self, newGame=False):
         """Generate a list of words"""
+        # remove current words from bank if newGame and not shuffle
+        if newGame and hasattr(self, 'words') and not self.mix:
+            if (self.wordbank and len(self.wordbank) - self.minWords >= self.minWords):
+                for word in self.words:
+                    self.wordbank.remove(word)
+            # reset wordbank to original list if wordbank exhausted
+            else:
+                self.wordbank = self.original_wordbank[:]
         self.words = self.__get_words(self.size)
         self.layout = self.__get_layout(self.size, int(self.teams))
         self.board = dict.fromkeys(self.words, False)
@@ -100,7 +106,10 @@ class Info(object):
         return ''.join(random.SystemRandom().choice(
             string.ascii_uppercase) for _ in range(id_length))
 
-    def __playtime(self):
+    def regenerate_id(self):
+        self.game_id = self.generate_room_id()
+
+    def playtime(self):
         # 2018-08-12 10:12:25.700528
         fmt = '%Y-%m-%d %H:%M:%S'
         d1 = self.date_created
@@ -108,36 +117,30 @@ class Info(object):
         # Convert to Unix timestamp
         d1_ts = time.mktime(d1.timetuple())
         d2_ts = time.mktime(d2.timetuple())
-
         return round(float(d2_ts-d1_ts) / 60, 2)
 
+    def __load_dictionary(self, d):
+        path = DICTIONARIES['dictionaries'][d]['filename']
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'dictionaries', path)
+        with open(path, 'r') as words_file:
+            return [elem for elem in words_file.read().split('\n') if len(elem.strip()) > 0]
 
     def __get_words(self, size):
         """Generate a list of words"""
-        if not self.dictionary in DICTIONARIES.keys():
-            print("Error: dictionary '" + self.dictionary + "' doesn't exist")
-            return None
         # override words with the wordbank
         words = self.wordbank
-        if not self.wordbank:
-            if self.mix:
-                words = []
-                for key in self.mix:
-                    # load and shuffle current dict
-                    tempWords = self.__load_words(key)
-                    random.shuffle(tempWords)
-                    # get word ratio (rounded up)
-                    numWords = math.ceil((self.mix[key]/100)*BOARD_SIZE[size])
-                    words = words + tempWords[0:numWords]
-            else:
-                words = self.__load_words(self.dictionary)
+        if self.mix:
+            words = []
+            for key in self.mix:
+                # load and shuffle current dict
+                tempWords = self.__load_dictionary(key)
+                random.shuffle(tempWords)
+                # get word ratio (rounded up)
+                numWords = int(math.ceil((self.mix[key]/100.0)*BOARD_SIZE[size]))
+                words = words + tempWords[0:numWords]
         random.shuffle(words)
         final_words = words[0:BOARD_SIZE[size]]
         return final_words
-
-    def __load_words(self, dict):
-        words_file = open(DICTIONARIES[dict], 'r')
-        return [elem for elem in words_file.read().split('\n') if len(elem.strip()) > 0]
 
     def __get_layout(self, size, teams):
         """Randomly generate a card layout"""
